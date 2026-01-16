@@ -105,8 +105,29 @@ func capture(flags flags) error {
 	}
 
 	// Write out a pcap file from aggregated packets
+	var packetCount uint64
+	var capturedBytes uint64
+	done := make(chan struct{})
+
 	go func() {
+		defer close(done)
 		for {
+			// Check packet limit
+			if flags.packetLimit > 0 && packetCount >= flags.packetLimit {
+				if !flags.quiet {
+					fmt.Fprintf(os.Stderr, "\nPacket limit reached: %d packets captured\n", packetCount)
+				}
+				return
+			}
+
+			// Check size limit (convert MB to bytes)
+			if flags.sizeLimit > 0 && capturedBytes >= flags.sizeLimit*1024*1024 {
+				if !flags.quiet {
+					fmt.Fprintf(os.Stderr, "\nSize limit reached: %.2f MB captured\n", float64(capturedBytes)/(1024*1024))
+				}
+				return
+			}
+
 			pkt, err := filter.read()
 			switch {
 			case err == errFilterClosed:
@@ -128,6 +149,9 @@ func capture(flags flags) error {
 				fmt.Fprintln(os.Stderr, "Error writing packet:", err)
 			}
 
+			packetCount++
+			capturedBytes += uint64(len(pkt.data))
+
 			if flags.flush {
 				err = pcapWriter.Flush()
 				if err != nil {
@@ -137,8 +161,12 @@ func capture(flags flags) error {
 		}
 	}()
 
-	<-sigs
-	return nil
+	select {
+	case <-sigs:
+		return nil
+	case <-done:
+		return nil
+	}
 }
 
 // newPcapWriter creates a pcapWriter with an pcap interface (metadata) per xdp action

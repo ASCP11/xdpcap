@@ -181,6 +181,10 @@ type flags struct {
 	// Filter provided as input. Not in any particular format, for metadata / debugging only.
 	filterExpr string
 	filterOpts filterOpts
+
+	// Capture limits
+	packetLimit uint64 // Maximum number of packets to capture (0 = unlimited)
+	sizeLimit   uint64 // Maximum capture size in megabytes (0 = unlimited)
 }
 
 // parseFlags creates the flags, and attempts to parse args.
@@ -198,6 +202,8 @@ func parseFlags(name string, args []string) (flags, error) {
 	flags.IntVar(&flags.filterOpts.perfWatermark, "watermark", 1, "Perf watermark (`bytes`). Must be < buffer.")
 	flags.BoolVar(&flags.quiet, "q", false, "Don't print statistics")
 	flags.BoolVar(&flags.flush, "flush", false, "Flush pcap data written to <output> for every packet received")
+	flags.Uint64Var(&flags.packetLimit, "c", 0, "Exit after capturing `count` packets (0 = unlimited)")
+	flags.Uint64Var(&flags.sizeLimit, "C", 0, "Exit after capturing approximately `megabytes` MB of data (0 = unlimited)")
 
 	flags.filterOpts.actions = []xdpAction{}
 	flags.Var((*actionsFlag)(&flags.filterOpts.actions), "actions", fmt.Sprintf("XDP `actions` to capture packets for. Comma separated list of names (%v) or enum values (default all actions exposed by the <debug map>)", xdpActions))
