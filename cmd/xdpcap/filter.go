@@ -90,22 +90,23 @@ func newFilterWithMap(hookMap *ebpf.Map, opts filterOpts) (*filter, error) {
 	}
 
 	xdpFragsMode := false
+	xdpAttachType := false
 	for i, action := range opts.actions {
-		program, err := newProgram(opts.filter, action, perfMap, xdpFragsMode)
+		program, err := newProgram(opts.filter, action, perfMap, xdpFragsMode, xdpAttachType)
 		if err != nil {
 			return nil, errors.Wrapf(err, "loading filter program for %v", action)
 		}
 
 		err = attachProg(hookMap, program.program.FD(), action)
 		if errors.Is(err, unix.EINVAL) && i == 0 {
-			// attempt to load first action in XDP frags mode and retry attaching
-			// if this doesn't work then there is underlying issue that is not
-			// related to the hook being attached in XDP frags mode and we make
-			// sure to return the original attachment error.
+			// Retry with both XDP attach type (required by kernels 6.1+ when the
+			// hook map's owner program sets expected_attach_type = BPF_XDP) and
+			// XDP frags mode. If this also fails we return the original error.
 			xdpFragsMode = true
+			xdpAttachType = true
 
 			var programErr error
-			if program, programErr = newProgram(opts.filter, action, perfMap, xdpFragsMode); programErr != nil {
+			if program, programErr = newProgram(opts.filter, action, perfMap, xdpFragsMode, xdpAttachType); programErr != nil {
 				return nil, errors.Wrapf(programErr, "loading filter program in XDP frags mode for %v", action)
 			}
 
