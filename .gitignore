@@ -1,0 +1,17 @@
+# Build output
+/xdpcap
+/cmd/xdpcap/xdpcap
+
+# Compiled BPF objects
+*.elf
+
+# Test artifacts
+/tmp/
+*.pcap
+*.pcapng
+
+# Editor and OS
+.DS_Store
+*.swp
+*.swo
+*~
