@@ -22,7 +22,7 @@ packets out to all of them.
 ### From source (recommended)
 
 ```bash
-git clone https://github.com/cloudflare/xdpcap
+git clone https://github.com/ASCP11/xdpcap
 cd xdpcap
 go build -o xdpcap ./cmd/xdpcap
 sudo install -m 755 xdpcap /usr/local/bin/xdpcap
@@ -31,7 +31,7 @@ sudo install -m 755 xdpcap /usr/local/bin/xdpcap
 ### With `go install`
 
 ```bash
-go install github.com/cloudflare/xdpcap/cmd/xdpcap@latest
+go install github.com/ASCP11/xdpcap/cmd/xdpcap@latest
 ```
 
 The binary lands in `$(go env GOPATH)/bin/xdpcap`. Make sure that directory is
