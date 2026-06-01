@@ -4,7 +4,7 @@
 // is also useful to examine any transformations done to a packet.
 //
 // xdpcap requires you to instrument your XDP code in a specific way,
-// check the documentation at https://github.com/cloudflare/xdpcap
+// check the documentation at https://github.com/ASCP11/xdpcap
 // for details.
 //
 // Once you have done so, you can capture into a file, or pipe

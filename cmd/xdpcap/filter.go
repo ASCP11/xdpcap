@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/cloudflare/xdpcap/internal"
+	"github.com/ASCP11/xdpcap/internal"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/perf"

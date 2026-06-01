@@ -1,4 +1,4 @@
-module github.com/cloudflare/xdpcap
+module github.com/ASCP11/xdpcap
 
 require (
 	github.com/cilium/ebpf v0.11.0
