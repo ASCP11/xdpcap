@@ -92,12 +92,12 @@ func (p *program) metrics() (metrics, error) {
 //
 //	<hookPath>_subs/                    flock'd to serialize (de)registration
 //	<hookPath>_subs/mode                coordinator load flags
-//	<hookPath>_subs/<slot>/pid          subscriber PID
+//	<hookPath>_subs/<slot>/             flock'd (shared) by its subscriber while alive
 //	<hookPath>_subs/<slot>/filter       serialized cBPF filter
 //	<hookPath>_subs/<slot>/perf         perf event array
 //	<hookPath>_subs/<slot>/metrics_<a>  per-CPU metrics for action a
 //
-// bpffs can only hold BPF objects, so the PID, filter and mode are stored in
+// bpffs can only hold BPF objects, so the filter and mode are stored in
 // single-entry array maps.
 
 // bpffsDir returns the bpffs directory holding all subscriber state for a hook.
@@ -127,11 +127,6 @@ func subFilterPath(hookPath string, slot int) string {
 	return filepath.Join(slotDir(hookPath, slot), "filter")
 }
 
-// subPIDPath is the bpffs pin path for a subscriber's PID.
-func subPIDPath(hookPath string, slot int) string {
-	return filepath.Join(slotDir(hookPath, slot), "pid")
-}
-
 // withSubsLock runs fn under an exclusive flock on bpffsDir, creating it if absent.
 func withSubsLock(hookPath string, fn func() error) error {
 	dir := bpffsDir(hookPath)
@@ -153,18 +148,17 @@ func withSubsLock(hookPath string, fn func() error) error {
 	return fn()
 }
 
-func processAlive(pid int) bool {
-	return syscall.Kill(pid, 0) == nil
-}
-
 // slotAlive reports whether slot is held by a running process.
+// Subscribers hold a shared flock on their slot dir for their whole lifetime; the
+// kernel releases it when the process exits, however it exits.
 func slotAlive(hookPath string, slot int) bool {
-	raw, err := readPinnedValue(subPIDPath(hookPath, slot))
-	if err != nil || len(raw) != 4 {
+	f, err := os.Open(slotDir(hookPath, slot))
+	if err != nil {
 		return false
 	}
-	pid := int(nativeEndian.Uint32(raw))
-	return pid > 0 && processAlive(pid)
+	defer f.Close()
+
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == syscall.EWOULDBLOCK
 }
 
 // cleanupSlot removes all bpffs state for a slot.
@@ -269,13 +263,15 @@ func (s *loadedSub) close() {
 }
 
 // registerSubscriber claims a free slot and pins this subscriber's state to bpffs.
+// It returns the slot and the open slot dir, whose flock marks the slot as live:
+// it must stay open until the subscriber is done.
 // The caller must hold the subscriber lock.
 func registerSubscriber(
 	hookPath string,
 	filter []bpf.Instruction,
 	perfMap *ebpf.Map,
 	metricsMaps map[xdpAction]*ebpf.Map,
-) (int, error) {
+) (int, *os.File, error) {
 	// Scan for a free slot, cleaning up stale ones as we go.
 	slot := -1
 	for i := 0; i < maxSubscribers; i++ {
@@ -286,40 +282,44 @@ func registerSubscriber(
 		}
 	}
 	if slot < 0 {
-		return 0, errors.Errorf("all %d subscriber slots are occupied", maxSubscribers)
+		return 0, nil, errors.Errorf("all %d subscriber slots are occupied", maxSubscribers)
 	}
 
 	if err := os.Mkdir(slotDir(hookPath, slot), 0700); err != nil {
-		return 0, errors.Wrap(err, "creating slot dir")
+		return 0, nil, errors.Wrap(err, "creating slot dir")
 	}
 
-	// Write PID first so we own the slot.
-	pid := make([]byte, 4)
-	nativeEndian.PutUint32(pid, uint32(os.Getpid()))
-	if err := pinValue(subPIDPath(hookPath, slot), "xdpcap_pid", pid); err != nil {
+	// Lock the slot first so we own it.
+	lock, err := os.Open(slotDir(hookPath, slot))
+	if err != nil {
 		cleanupSlot(hookPath, slot)
-		return 0, errors.Wrap(err, "pinning pid")
+		return 0, nil, errors.Wrap(err, "opening slot dir")
+	}
+	fail := func(err error) (int, *os.File, error) {
+		cleanupSlot(hookPath, slot)
+		lock.Close()
+		return 0, nil, err
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		return fail(errors.Wrap(err, "locking slot dir"))
 	}
 
 	if err := writeFilter(subFilterPath(hookPath, slot), filter); err != nil {
-		cleanupSlot(hookPath, slot)
-		return 0, errors.Wrap(err, "pinning filter")
+		return fail(errors.Wrap(err, "pinning filter"))
 	}
 
 	if err := perfMap.Pin(subPerfPath(hookPath, slot)); err != nil {
-		cleanupSlot(hookPath, slot)
-		return 0, errors.Wrap(err, "pinning perf map")
+		return fail(errors.Wrap(err, "pinning perf map"))
 	}
 
 	// Pin metrics maps (only for the actions this subscriber captures).
 	for a, m := range metricsMaps {
 		if err := m.Pin(subMetricsPath(hookPath, slot, a)); err != nil {
-			cleanupSlot(hookPath, slot)
-			return 0, errors.Wrapf(err, "pinning metrics map for action %v", a)
+			return fail(errors.Wrapf(err, "pinning metrics map for action %v", a))
 		}
 	}
 
-	return slot, nil
+	return slot, lock, nil
 }
 
 // loadAllSubscribers reads all live subscriber slots from bpffs.
@@ -352,7 +352,7 @@ func loadAllSubscribers(hookPath string) ([]loadedSub, error) {
 		filter, err := readFilter(subFilterPath(hookPath, i))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				// PID written but process crashed before completing registration.
+				// Slot locked but registration not complete.
 				cleanupSlot(hookPath, i)
 				continue
 			}

@@ -39,6 +39,7 @@ type filter struct {
 	hookPath     string // bpffs path of the hook map
 	ownsHookMap  bool   // true when hookMap was opened by newFilter and must be closed by close()
 	slot         int
+	slotLock     *os.File // open slot dir, flock'd while this subscriber is alive
 	reader       *perf.Reader
 	perfMap      *ebpf.Map
 	programs     map[xdpAction]*program // coordinator progs + this subscriber's metrics maps
@@ -161,11 +162,11 @@ func newFilterWithMap(hookMap *ebpf.Map, hookPath string, opts filterOpts) (*fil
 		}()
 
 		// Claim a slot.
-		slot, err := registerSubscriber(hookPath, opts.filter, perfMap, metricsMaps)
+		slot, slotLock, err := registerSubscriber(hookPath, opts.filter, perfMap, metricsMaps)
 		if err != nil {
 			return err
 		}
-		f.slot = slot
+		f.slot, f.slotLock = slot, slotLock
 
 		// Build the full subscriber list without a second bpffs walk: append a
 		// loadedSub for this subscriber using the already-open in-memory maps.
@@ -179,8 +180,7 @@ func newFilterWithMap(hookMap *ebpf.Map, hookPath string, opts filterOpts) (*fil
 			var frags, attach bool
 			coordProgs, frags, attach, err = installCoordinator(hookMap, allSubs, actions)
 			if err != nil {
-				cleanupSlot(hookPath, slot)
-				f.slot = -1
+				f.releaseSlot()
 				return errors.Wrap(err, "installing coordinator")
 			}
 			xdpFrags, xdpAttach = frags, attach
@@ -194,16 +194,14 @@ func newFilterWithMap(hookMap *ebpf.Map, hookPath string, opts filterOpts) (*fil
 				var instErr error
 				coordProgs, frags, attach, instErr = installCoordinator(hookMap, allSubs, actions)
 				if instErr != nil {
-					cleanupSlot(hookPath, slot)
-					f.slot = -1
+					f.releaseSlot()
 					return errors.Wrap(instErr, "installing coordinator for subsequent subscriber (mode file missing)")
 				}
 			} else {
 				var reinstErr error
 				coordProgs, reinstErr = reinstallCoordinator(hookMap, allSubs, actions, frags, attach)
 				if reinstErr != nil {
-					cleanupSlot(hookPath, slot)
-					f.slot = -1
+					f.releaseSlot()
 					return errors.Wrap(reinstErr, "reinstalling coordinator")
 				}
 			}
@@ -251,6 +249,14 @@ func allActions(hookMap *ebpf.Map) []xdpAction {
 	return actions
 }
 
+// releaseSlot removes this subscriber's slot state and gives up the slot.
+// The caller must hold the subscriber lock.
+func (f *filter) releaseSlot() {
+	cleanupSlot(f.hookPath, f.slot)
+	f.slotLock.Close()
+	f.slot = -1
+}
+
 // close detaches this subscriber, regenerates (or removes) the coordinator, and
 // releases all resources.
 func (f *filter) close() error {
@@ -261,7 +267,7 @@ func (f *filter) close() error {
 	if f.slot >= 0 {
 		err := withSubsLock(f.hookPath, func() error {
 			// Remove our slot files first.
-			cleanupSlot(f.hookPath, f.slot)
+			f.releaseSlot()
 
 			// Reload remaining subscribers.
 			remaining, err := loadAllSubscribers(f.hookPath)

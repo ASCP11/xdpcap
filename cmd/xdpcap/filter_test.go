@@ -370,14 +370,14 @@ func TestSubscriberUnregisterReinstalls(t *testing.T) {
 	}
 }
 
-// TestPartialRegistrationReclaimed verifies that a slot whose PID was pinned
-// by the current process but whose filter/perf maps were never created (simulating
-// a crash mid-registration) is treated as stale and reclaimed by the next subscriber.
+// TestPartialRegistrationReclaimed verifies that a slot whose filter/perf maps
+// were never created (simulating a crash mid-registration) is treated as stale
+// and reclaimed by the next subscriber.
 func TestPartialRegistrationReclaimed(t *testing.T) {
 	hm := hookMap(t, 4)
 	hp := bpfTempPath(t)
 
-	// Pin a PID for slot 0 (our own PID), but do NOT pin the filter or any maps.
+	// Create slot 0, but do NOT pin the filter or any maps.
 	pinPartialSlot(t, hp, 0)
 
 	// A new subscriber must succeed by reclaiming the incomplete slot.
@@ -388,6 +388,34 @@ func TestPartialRegistrationReclaimed(t *testing.T) {
 		t.Fatalf("new subscriber rejected despite stale partial slot: %v", err)
 	}
 	f.close()
+}
+
+// TestSlotAliveTracksLock verifies that a slot is live exactly while some open
+// file holds the slot dir flock, independent of PIDs.
+func TestSlotAliveTracksLock(t *testing.T) {
+	hp := bpfTempPath(t)
+	pinPartialSlot(t, hp, 0)
+
+	if slotAlive(hp, 0) {
+		t.Fatal("unlocked slot reported alive")
+	}
+
+	lock, err := os.Open(slotDir(hp, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_SH); err != nil {
+		t.Fatal(err)
+	}
+	if !slotAlive(hp, 0) {
+		t.Fatal("locked slot reported dead")
+	}
+
+	// Closing the file is what happens when the subscriber process dies.
+	lock.Close()
+	if slotAlive(hp, 0) {
+		t.Fatal("slot still alive after lock released")
+	}
 }
 
 // TestStateNotInTmp verifies that registering a subscriber keeps all state on
@@ -401,7 +429,7 @@ func TestStateNotInTmp(t *testing.T) {
 	f := mustNew(t, testOpts(bpf.RetConstant{Val: 3}))
 	defer f.close()
 
-	for _, p := range []string{subPIDPath(f.hookPath, f.slot), subFilterPath(f.hookPath, f.slot), subPerfPath(f.hookPath, f.slot)} {
+	for _, p := range []string{slotDir(f.hookPath, f.slot), subFilterPath(f.hookPath, f.slot), subPerfPath(f.hookPath, f.slot)} {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("missing bpffs state %s: %v", p, err)
 		}
@@ -553,11 +581,6 @@ func pinPartialSlot(t *testing.T, hookPath string, slot int) {
 	t.Helper()
 
 	if err := os.MkdirAll(slotDir(hookPath, slot), 0700); err != nil {
-		t.Fatal(err)
-	}
-	pid := make([]byte, 4)
-	nativeEndian.PutUint32(pid, uint32(os.Getpid()))
-	if err := pinValue(subPIDPath(hookPath, slot), "xdpcap_pid", pid); err != nil {
 		t.Fatal(err)
 	}
 }

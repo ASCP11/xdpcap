@@ -418,7 +418,7 @@ func TestLiveSubscriberJoinLeave(t *testing.T) {
 func TestLivePartialRegistrationRecovery(t *testing.T) {
 	hookPin := liveSetup(t)
 
-	// Pin a PID for slot 0 (our own live PID) without any maps.
+	// Create slot 0 without any maps.
 	pinPartialSlot(t, hookPin, 0)
 
 	f, err := newFilter(hookPin, liveOpts(bpf.RetConstant{Val: 3}))
