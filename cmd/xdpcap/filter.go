@@ -49,6 +49,11 @@ type filter struct {
 
 // newFilter creates a filter from a pinned hook map path.
 func newFilter(hookMapPath string, opts filterOpts) (*filter, error) {
+	hookMapPath, err := canonicalHookPath(hookMapPath)
+	if err != nil {
+		return nil, errors.Wrap(err, "resolving hook map path")
+	}
+
 	hookMap, err := ebpf.LoadPinnedMap(hookMapPath, nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "loading hook map")
@@ -61,6 +66,16 @@ func newFilter(hookMapPath string, opts filterOpts) (*filter, error) {
 	}
 	f.ownsHookMap = true
 	return f, nil
+}
+
+// canonicalHookPath resolves path to an absolute path without symlinks, so every
+// spelling of the same pinned hook map shares the same subscriber state.
+func canonicalHookPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(abs)
 }
 
 // newFilterWithMap creates a filter from an already-opened hook map.

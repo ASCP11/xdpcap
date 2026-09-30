@@ -456,6 +456,33 @@ func TestCloseRemovesAllHookMapEntries(t *testing.T) {
 	}
 }
 
+// TestCanonicalHookPath verifies that different spellings of the same pinned hook
+// map resolve to one path, so their subscribers share state.
+func TestCanonicalHookPath(t *testing.T) {
+	hp := bpfTempPath(t)
+	if err := hookMap(t, 4).Pin(hp); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(hp) })
+
+	link := hp + "_link"
+	if err := os.Symlink(hp, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(link) })
+
+	dir, base := filepath.Split(hp)
+	for _, alias := range []string{hp, dir + "/" + base, dir + "./" + base, link} {
+		got, err := canonicalHookPath(alias)
+		if err != nil {
+			t.Fatalf("%s: %v", alias, err)
+		}
+		if got != hp {
+			t.Errorf("canonicalHookPath(%q) = %q, want %q", alias, got, hp)
+		}
+	}
+}
+
 // checkActions checks that all coordinator programs return their expected action.
 func checkActions(t *testing.T, actions []xdpAction, f *filter, in []byte) {
 	t.Helper()
