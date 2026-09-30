@@ -22,11 +22,15 @@ import (
 // maxSubscribers is the compile-time cap on concurrent xdpcap captures per hook.
 const maxSubscribers = 16
 
-// stackReserved is the number of stack bytes the coordinator uses before cbpfc scratch:
-//   [R10-4]      4-byte map key
-//   [R10-8..23]  16-byte perf output header (u64 action, u64 length)
-//                 R10-16: action (sent first → raw[0:8] in perf record)
-//                 R10-8:  length (sent second → raw[8:16] in perf record)
+// stackReserved is the number of stack bytes below R10 kept free of cbpfc scratch:
+//
+//	[R10-4,  R10-1]   u32 metrics map key
+//	[R10-16, R10-9]   u64 action (raw[0:8] in the perf record)
+//	[R10-8,  R10-1]   u64 packet length (raw[8:16] in the perf record)
+//
+// The perf header overwrites the map key. That is safe because the key is
+// stored again right before every lookup, and the header is written after it.
+// Only 16 bytes are used; the extra 4 are slack.
 const stackReserved = 20
 
 const BPF_F_CURRENT_CPU int64 = 0xFFFFFFFF
