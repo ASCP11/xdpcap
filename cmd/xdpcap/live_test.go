@@ -4,9 +4,11 @@ package main
 //
 // Prerequisites (handled automatically by setup):
 //   - Run as root
-//   - Interface "enp5s0f0" exists and is UP (10.25.0.5/24)
-//   - "macvlan0" (10.25.0.100/24) bridged on enp5s0f0 for ingress traffic generation
-//   - /tmp/xdpcap binary built (go build -o /tmp/xdpcap ./cmd/xdpcap/)
+//   - Interface $XDPCAP_LIVE_IFACE (default "enp5s0f0") exists and is UP,
+//     with $XDPCAP_LIVE_TARGET_IP (default 10.25.0.5/24)
+//   - $XDPCAP_LIVE_MACVLAN (default "macvlan0", $XDPCAP_LIVE_MACVLAN_IP default
+//     10.25.0.100/24) bridged on it for ingress traffic generation
+//   - xdpcap binary built at $XDPCAP_BIN (default /tmp/xdpcap)
 //
 // Run: sudo -E $(which go) test ./cmd/xdpcap/ -v -run TestLive -count=1 -timeout 120s
 
@@ -27,14 +29,24 @@ import (
 )
 
 const (
-	liveELF       = "../../testdata/xdp_hook.c.elf"
-	liveIface     = "enp5s0f0"
-	liveMacvlan   = "macvlan0"
-	liveMacvlanIP = "10.25.0.100"
-	liveTargetIP  = "10.25.0.5"
-	liveHookPin   = "/sys/fs/bpf/xdpcap_live_test"
-	xdpcapBin     = "/tmp/xdpcap"
+	liveELF     = "../../testdata/xdp_hook.c.elf"
+	liveHookPin = "/sys/fs/bpf/xdpcap_live_test"
 )
+
+var (
+	liveIface     = envOr("XDPCAP_LIVE_IFACE", "enp5s0f0")
+	liveMacvlan   = envOr("XDPCAP_LIVE_MACVLAN", "macvlan0")
+	liveMacvlanIP = envOr("XDPCAP_LIVE_MACVLAN_IP", "10.25.0.100")
+	liveTargetIP  = envOr("XDPCAP_LIVE_TARGET_IP", "10.25.0.5")
+	xdpcapBin     = envOr("XDPCAP_BIN", "/tmp/xdpcap")
+)
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 // liveSetup attaches the XDP hook ELF to liveIface, pins the hook map,
 // and returns a teardown function. Skips the test if not root or if the
@@ -115,7 +127,7 @@ func liveSetup(t *testing.T) string {
 	return liveHookPin
 }
 
-// ensureMacvlan creates macvlan0 (10.25.0.100/24) on top of liveIface if absent.
+// ensureMacvlan creates liveMacvlan (liveMacvlanIP/24) on top of liveIface if absent.
 func ensureMacvlan(t *testing.T) {
 	t.Helper()
 	if _, err := net.InterfaceByName(liveMacvlan); err == nil {
@@ -531,7 +543,7 @@ func TestLiveBinaryMultiCapture(t *testing.T) {
 	hookPin := liveSetup(t)
 
 	if _, err := os.Stat(xdpcapBin); err != nil {
-		t.Skipf("xdpcap binary not found at %s (run: go build -o /tmp/xdpcap ./cmd/xdpcap/)", xdpcapBin)
+		t.Skipf("xdpcap binary not found at %s (run: go build -o %[1]s ./cmd/xdpcap/)", xdpcapBin)
 	}
 
 	cap1 := "/tmp/live_cap1.pcapng"

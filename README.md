@@ -198,8 +198,18 @@ sudo -E $(which go) test ./...
 
 Live tests attach a real XDP hook to a named interface and exercise
 multi-subscriber coordination end-to-end. They run as part of the normal test
-suite when root is available:
+suite when root is available and the interface exists, and are skipped
+otherwise:
 
 ```bash
-sudo -E $(which go) test ./cmd/xdpcap/ -v -run TestLive -timeout 180s
+go build -o /tmp/xdpcap ./cmd/xdpcap/
+sudo -E XDPCAP_LIVE_IFACE=eth0 $(which go) test ./cmd/xdpcap/ -v -run TestLive -timeout 180s
 ```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `XDPCAP_LIVE_IFACE` | `enp5s0f0` | Interface the XDP hook is attached to |
+| `XDPCAP_LIVE_MACVLAN` | `macvlan0` | macvlan created on it to generate traffic |
+| `XDPCAP_LIVE_MACVLAN_IP` | `10.25.0.100` | Address of the macvlan (/24) |
+| `XDPCAP_LIVE_TARGET_IP` | `10.25.0.5` | Address pinged through the interface |
+| `XDPCAP_BIN` | `/tmp/xdpcap` | xdpcap binary used by the binary tests |
