@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -84,67 +85,63 @@ func (p *program) metrics() (metrics, error) {
 }
 
 // ---- bpffs state ----
+//
+// All subscriber state lives on bpffs next to the hook map, so it is only
+// accessible to privileged users and is shared by every process that can see
+// the hook map:
+//
+//	<hookPath>_subs/                    flock'd to serialize (de)registration
+//	<hookPath>_subs/mode                coordinator load flags
+//	<hookPath>_subs/<slot>/pid          subscriber PID
+//	<hookPath>_subs/<slot>/filter       serialized cBPF filter
+//	<hookPath>_subs/<slot>/perf         perf event array
+//	<hookPath>_subs/<slot>/metrics_<a>  per-CPU metrics for action a
+//
+// bpffs can only hold BPF objects, so the PID, filter and mode are stored in
+// single-entry array maps.
 
-// bpffsDir returns the bpffs directory used for pinned maps.
-// bpffs only allows BPF object pins; regular files must live elsewhere.
+// bpffsDir returns the bpffs directory holding all subscriber state for a hook.
 func bpffsDir(hookPath string) string {
 	return hookPath + "_subs"
 }
 
-// stateDir returns the regular-filesystem directory for PID, filter, and mode files.
-// The encoding is injective: alphanumerics and '-' are kept verbatim, '_' is
-// doubled to '__', and every other byte is encoded as '_HH' (lowercase hex).
-// Operating byte-by-byte means any two distinct hookPaths produce distinct dirs.
-func stateDir(hookPath string) string {
-	var b strings.Builder
-	for i := 0; i < len(hookPath); i++ {
-		c := hookPath[i]
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-':
-			b.WriteByte(c)
-		case c == '_':
-			b.WriteString("__")
-		default:
-			fmt.Fprintf(&b, "_%02x", c)
-		}
-	}
-	return filepath.Join("/tmp", "xdpcap_"+b.String())
+// slotDir is the bpffs directory holding one subscriber's state.
+func slotDir(hookPath string, slot int) string {
+	return filepath.Join(bpffsDir(hookPath), strconv.Itoa(slot))
 }
 
 // subPerfPath is the bpffs pin path for a subscriber's perf map.
 func subPerfPath(hookPath string, slot int) string {
-	return filepath.Join(bpffsDir(hookPath), fmt.Sprintf("%d_perf", slot))
+	return filepath.Join(slotDir(hookPath, slot), "perf")
 }
+
+const metricsPinPrefix = "metrics_"
 
 // subMetricsPath is the bpffs pin path for a subscriber's metrics map for one action.
 func subMetricsPath(hookPath string, slot int, action xdpAction) string {
-	return filepath.Join(bpffsDir(hookPath), fmt.Sprintf("%d_metrics_%d", slot, int(action)))
+	return filepath.Join(slotDir(hookPath, slot), fmt.Sprintf("%s%d", metricsPinPrefix, int(action)))
 }
 
-// subFilterPath is the regular-fs path for a subscriber's serialized cBPF filter.
+// subFilterPath is the bpffs pin path for a subscriber's serialized cBPF filter.
 func subFilterPath(hookPath string, slot int) string {
-	return filepath.Join(stateDir(hookPath), fmt.Sprintf("%d_filter", slot))
+	return filepath.Join(slotDir(hookPath, slot), "filter")
 }
 
-// subPIDPath is the regular-fs path for a subscriber's PID file.
+// subPIDPath is the bpffs pin path for a subscriber's PID.
 func subPIDPath(hookPath string, slot int) string {
-	return filepath.Join(stateDir(hookPath), fmt.Sprintf("%d_pid", slot))
+	return filepath.Join(slotDir(hookPath, slot), "pid")
 }
 
-// withSubsLock runs fn under an exclusive flock on stateDir.
-// Both stateDir and bpffsDir are created if absent.
+// withSubsLock runs fn under an exclusive flock on bpffsDir, creating it if absent.
 func withSubsLock(hookPath string, fn func() error) error {
-	sd := stateDir(hookPath)
-	if err := os.MkdirAll(sd, 0700); err != nil {
-		return errors.Wrap(err, "creating state dir")
-	}
-	if err := os.MkdirAll(bpffsDir(hookPath), 0700); err != nil {
+	dir := bpffsDir(hookPath)
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return errors.Wrap(err, "creating bpffs dir")
 	}
 
-	f, err := os.Open(sd)
+	f, err := os.Open(dir)
 	if err != nil {
-		return errors.Wrap(err, "opening state dir for lock")
+		return errors.Wrap(err, "opening bpffs dir for lock")
 	}
 	defer f.Close()
 
@@ -160,50 +157,89 @@ func processAlive(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
 }
 
-// cleanupSlot removes all state and bpffs files for a slot.
-func cleanupSlot(hookPath string, slot int) {
-	os.Remove(subFilterPath(hookPath, slot))
-	os.Remove(subPIDPath(hookPath, slot))
-	os.Remove(subPerfPath(hookPath, slot))
-	// Remove metrics pins for all possible action indices, not just the standard 5,
-	// to handle hooks with non-standard action counts.
-	for a := xdpAction(0); a < xdpAction(32); a++ {
-		os.Remove(subMetricsPath(hookPath, slot, a))
+// slotAlive reports whether slot is held by a running process.
+func slotAlive(hookPath string, slot int) bool {
+	raw, err := readPinnedValue(subPIDPath(hookPath, slot))
+	if err != nil || len(raw) != 4 {
+		return false
 	}
+	pid := int(nativeEndian.Uint32(raw))
+	return pid > 0 && processAlive(pid)
+}
+
+// cleanupSlot removes all bpffs state for a slot.
+func cleanupSlot(hookPath string, slot int) {
+	os.RemoveAll(slotDir(hookPath, slot))
+}
+
+// ---- single value pins ----
+
+// pinValue pins a single-entry array map holding value at path.
+func pinValue(path, name string, value []byte) error {
+	m, err := ebpf.NewMap(&ebpf.MapSpec{
+		Name:       name,
+		Type:       ebpf.Array,
+		KeySize:    4,
+		ValueSize:  uint32(len(value)),
+		MaxEntries: 1,
+	})
+	if err != nil {
+		return errors.Wrapf(err, "creating %s map", name)
+	}
+	defer m.Close()
+
+	if err := m.Put(uint32(0), value); err != nil {
+		return errors.Wrapf(err, "writing %s map", name)
+	}
+	return m.Pin(path)
+}
+
+// readPinnedValue reads the value stored by pinValue.
+func readPinnedValue(path string) ([]byte, error) {
+	m, err := ebpf.LoadPinnedMap(path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer m.Close()
+
+	if m.Type() != ebpf.Array || m.KeySize() != 4 || m.MaxEntries() != 1 {
+		return nil, errors.Errorf("%s: unexpected map layout", path)
+	}
+
+	value := make([]byte, m.ValueSize())
+	if err := m.Lookup(uint32(0), &value); err != nil {
+		return nil, errors.Wrapf(err, "reading %s", path)
+	}
+	return value, nil
 }
 
 // ---- filter serialization ----
 
 func writeFilter(path string, filter []bpf.Instruction) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
+	var buf bytes.Buffer
 	for _, insn := range filter {
 		raw, err := insn.Assemble()
 		if err != nil {
 			return errors.Wrap(err, "assembling instruction")
 		}
-		if err := binary.Write(f, binary.LittleEndian, raw); err != nil {
+		if err := binary.Write(&buf, binary.LittleEndian, raw); err != nil {
 			return err
 		}
 	}
-	return nil
+	return pinValue(path, "xdpcap_filter", buf.Bytes())
 }
 
 func readFilter(path string) ([]bpf.Instruction, error) {
-	f, err := os.Open(path)
+	value, err := readPinnedValue(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
+	r := bytes.NewReader(value)
 	var insns []bpf.Instruction
 	for {
 		var raw bpf.RawInstruction
-		err := binary.Read(f, binary.LittleEndian, &raw)
+		err := binary.Read(r, binary.LittleEndian, &raw)
 		if err == io.EOF {
 			break
 		}
@@ -232,8 +268,8 @@ func (s *loadedSub) close() {
 	}
 }
 
-// registerSubscriber claims a free slot, writes state files, and pins maps to bpffs.
-// The caller must hold the subsDir lock.
+// registerSubscriber claims a free slot and pins this subscriber's state to bpffs.
+// The caller must hold the subscriber lock.
 func registerSubscriber(
 	hookPath string,
 	filter []bpf.Instruction,
@@ -243,16 +279,7 @@ func registerSubscriber(
 	// Scan for a free slot, cleaning up stale ones as we go.
 	slot := -1
 	for i := 0; i < maxSubscribers; i++ {
-		data, err := os.ReadFile(subPIDPath(hookPath, i))
-		if os.IsNotExist(err) {
-			slot = i
-			break
-		}
-		if err != nil {
-			return 0, errors.Wrapf(err, "reading pid for slot %d", i)
-		}
-		pid, pidErr := strconv.Atoi(strings.TrimSpace(string(data)))
-		if pidErr != nil || pid <= 0 || !processAlive(pid) {
+		if !slotAlive(hookPath, i) {
 			cleanupSlot(hookPath, i)
 			slot = i
 			break
@@ -262,18 +289,23 @@ func registerSubscriber(
 		return 0, errors.Errorf("all %d subscriber slots are occupied", maxSubscribers)
 	}
 
-	// Write PID first so we own the slot.
-	if err := os.WriteFile(subPIDPath(hookPath, slot), []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
-		return 0, errors.Wrap(err, "writing pid file")
+	if err := os.Mkdir(slotDir(hookPath, slot), 0700); err != nil {
+		return 0, errors.Wrap(err, "creating slot dir")
 	}
 
-	// Write filter.
+	// Write PID first so we own the slot.
+	pid := make([]byte, 4)
+	nativeEndian.PutUint32(pid, uint32(os.Getpid()))
+	if err := pinValue(subPIDPath(hookPath, slot), "xdpcap_pid", pid); err != nil {
+		cleanupSlot(hookPath, slot)
+		return 0, errors.Wrap(err, "pinning pid")
+	}
+
 	if err := writeFilter(subFilterPath(hookPath, slot), filter); err != nil {
 		cleanupSlot(hookPath, slot)
-		return 0, errors.Wrap(err, "writing filter file")
+		return 0, errors.Wrap(err, "pinning filter")
 	}
 
-	// Pin perf map.
 	if err := perfMap.Pin(subPerfPath(hookPath, slot)); err != nil {
 		cleanupSlot(hookPath, slot)
 		return 0, errors.Wrap(err, "pinning perf map")
@@ -291,7 +323,7 @@ func registerSubscriber(
 }
 
 // loadAllSubscribers reads all live subscriber slots from bpffs.
-// Stale entries (dead PID) are cleaned up. Caller must hold the subsDir lock.
+// Stale entries are cleaned up. Caller must hold the subscriber lock.
 // On error, any already-loaded subscribers are closed before returning.
 func loadAllSubscribers(hookPath string) ([]loadedSub, error) {
 	var subs []loadedSub
@@ -303,17 +335,16 @@ func loadAllSubscribers(hookPath string) ([]loadedSub, error) {
 	}
 
 	for i := 0; i < maxSubscribers; i++ {
-		data, err := os.ReadFile(subPIDPath(hookPath, i))
+		entries, err := os.ReadDir(slotDir(hookPath, i))
 		if os.IsNotExist(err) {
 			continue
 		}
 		if err != nil {
 			closeAll()
-			return nil, errors.Wrapf(err, "reading pid for slot %d", i)
+			return nil, errors.Wrapf(err, "reading slot %d", i)
 		}
 
-		pid, pidErr := strconv.Atoi(strings.TrimSpace(string(data)))
-		if pidErr != nil || pid <= 0 || !processAlive(pid) {
+		if !slotAlive(hookPath, i) {
 			cleanupSlot(hookPath, i)
 			continue
 		}
@@ -340,21 +371,25 @@ func loadAllSubscribers(hookPath string) ([]loadedSub, error) {
 		}
 
 		metricsMaps := make(map[xdpAction]*ebpf.Map)
-		for a := xdpAction(0); a < xdpAction(32); a++ {
-			path := subMetricsPath(hookPath, i, a)
-			if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-				continue // subscriber doesn't capture this action
+		for _, entry := range entries {
+			suffix, ok := strings.CutPrefix(entry.Name(), metricsPinPrefix)
+			if !ok {
+				continue
 			}
-			m, err := ebpf.LoadPinnedMap(path, nil)
+			a, err := strconv.Atoi(suffix)
+			if err != nil {
+				continue
+			}
+			m, err := ebpf.LoadPinnedMap(subMetricsPath(hookPath, i, xdpAction(a)), nil)
 			if err != nil {
 				perfMap.Close()
 				for _, already := range metricsMaps {
 					already.Close()
 				}
 				closeAll()
-				return nil, errors.Wrapf(err, "loading metrics map for slot %d action %v", i, a)
+				return nil, errors.Wrapf(err, "loading metrics map for slot %d action %v", i, xdpAction(a))
 			}
-			metricsMaps[a] = m
+			metricsMaps[xdpAction(a)] = m
 		}
 
 		subs = append(subs, loadedSub{

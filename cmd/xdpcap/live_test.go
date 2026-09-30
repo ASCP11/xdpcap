@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -110,7 +109,6 @@ func liveSetup(t *testing.T) string {
 		os.Remove(liveHookPin)
 		// clean up bpffs and state dirs left by any subscriber
 		os.RemoveAll(bpffsDir(liveHookPin))
-		os.RemoveAll(stateDir(liveHookPin))
 		t.Logf("[teardown] XDP detached, pin removed")
 	})
 
@@ -420,14 +418,8 @@ func TestLiveSubscriberJoinLeave(t *testing.T) {
 func TestLivePartialRegistrationRecovery(t *testing.T) {
 	hookPin := liveSetup(t)
 
-	// Write a PID file for slot 0 (our own live PID) without any maps.
-	sd := stateDir(hookPin)
-	os.MkdirAll(sd, 0700)
-	pidFile := subPIDPath(hookPin, 0)
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
-		t.Fatalf("write pid: %v", err)
-	}
-	defer os.Remove(pidFile)
+	// Pin a PID for slot 0 (our own live PID) without any maps.
+	pinPartialSlot(t, hookPin, 0)
 
 	f, err := newFilter(hookPin, liveOpts(bpf.RetConstant{Val: 3}))
 	if err != nil {
@@ -615,27 +607,6 @@ func TestLiveBinaryMultiCapture(t *testing.T) {
 	}
 }
 
-// ── Test 9: stateDir is injective (no collisions after fix) ──────────────────
-func TestLiveStateDirInjective(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("requires root")
-	}
-	pairs := [][2]string{
-		{"/sys/fs/bpf/hook_test", "/sys/fs/bpf/hook.test"},
-		{"/sys/fs/bpf/a_b_c", "/sys/fs/bpf/a.b.c"},
-		{"/sys/fs/bpf/live__hook", "/sys/fs/bpf/live_hook"},
-	}
-	for _, p := range pairs {
-		a, b := stateDir(p[0]), stateDir(p[1])
-		if a == b {
-			t.Errorf("REGRESSION – collision: %q and %q both → %q", p[0], p[1], a)
-		} else {
-			t.Logf("OK %q → %q", p[0], a)
-			t.Logf("OK %q → %q", p[1], b)
-		}
-	}
-}
-
 // ── Test 10: binary filter split – unfiltered vs ICMP-only ───────────────────
 //
 // Injects a mix of ICMP-shaped and non-ICMP packets via the in-process
@@ -726,17 +697,15 @@ func TestLiveBinaryFilteredMultiCapture(t *testing.T) {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-// waitForSubscriberCount polls the state dir until at least n PID files are
-// present (meaning n subscriber processes have completed registration).
+// waitForSubscriberCount polls bpffs until at least n slots are held by live
+// processes (meaning n subscriber processes have completed registration).
 func waitForSubscriberCount(hookPin string, n int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		count := 0
 		for i := 0; i < maxSubscribers; i++ {
-			if data, err := os.ReadFile(subPIDPath(hookPin, i)); err == nil {
-				if pid, _ := strconv.Atoi(strings.TrimSpace(string(data))); pid > 0 && processAlive(pid) {
-					count++
-				}
+			if slotAlive(hookPin, i) {
+				count++
 			}
 		}
 		if count >= n {

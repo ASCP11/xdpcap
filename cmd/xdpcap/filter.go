@@ -348,28 +348,33 @@ func (f *filter) metrics() (map[xdpAction]metrics, error) {
 // ---- coordinator mode persistence ----
 
 func coordinatorModePath(hookPath string) string {
-	return filepath.Join(stateDir(hookPath), "coord_mode")
+	return filepath.Join(bpffsDir(hookPath), "mode")
 }
 
 func writeCoordinatorMode(hookPath string, frags, attachType bool) error {
-	val := 0
+	var val uint32
 	if frags {
 		val |= 1
 	}
 	if attachType {
 		val |= 2
 	}
-	return os.WriteFile(coordinatorModePath(hookPath), []byte(fmt.Sprintf("%d", val)), 0644)
+	raw := make([]byte, 4)
+	nativeEndian.PutUint32(raw, val)
+
+	path := coordinatorModePath(hookPath)
+	os.Remove(path)
+	return pinValue(path, "xdpcap_mode", raw)
 }
 
 func readCoordinatorMode(hookPath string) (frags bool, attachType bool, err error) {
-	data, err := os.ReadFile(coordinatorModePath(hookPath))
+	raw, err := readPinnedValue(coordinatorModePath(hookPath))
 	if err != nil {
 		return false, false, err
 	}
-	var n int
-	if _, err := fmt.Sscanf(string(data), "%d", &n); err != nil {
-		return false, false, errors.Wrap(err, "parsing coordinator mode")
+	if len(raw) != 4 {
+		return false, false, errors.New("parsing coordinator mode: unexpected size")
 	}
+	n := nativeEndian.Uint32(raw)
 	return n&1 != 0, n&2 != 0, nil
 }

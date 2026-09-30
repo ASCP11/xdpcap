@@ -166,6 +166,10 @@ The coordinator is installed automatically on first attach and removed when the
 last subscriber exits. Stale subscriber state from crashed processes is cleaned
 up automatically.
 
+Subscriber state is pinned on bpffs next to the hook map, in `<debug map>_subs/`,
+so it is only accessible to privileged users and shared by every process that
+can see the hook map.
+
 
 ## Limitations
 

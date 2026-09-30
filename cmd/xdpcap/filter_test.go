@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"strconv"
+	"path/filepath"
 	"testing"
 
 	"github.com/ASCP11/xdpcap/internal"
@@ -49,7 +49,6 @@ func bpfTempPath(t *testing.T) string {
 	path := fmt.Sprintf("/sys/fs/bpf/xdpcap_%d_%s", os.Getpid(), sanitized)
 	t.Cleanup(func() {
 		os.RemoveAll(bpffsDir(path))
-		os.RemoveAll(stateDir(path))
 	})
 	return path
 }
@@ -371,23 +370,15 @@ func TestSubscriberUnregisterReinstalls(t *testing.T) {
 	}
 }
 
-// TestPartialRegistrationReclaimed verifies that a slot whose PID file was written
-// by the current process but whose filter/perf files were never created (simulating
+// TestPartialRegistrationReclaimed verifies that a slot whose PID was pinned
+// by the current process but whose filter/perf maps were never created (simulating
 // a crash mid-registration) is treated as stale and reclaimed by the next subscriber.
 func TestPartialRegistrationReclaimed(t *testing.T) {
 	hm := hookMap(t, 4)
 	hp := bpfTempPath(t)
 
-	// Pre-create state dir and write a PID file for slot 0 (our own PID),
-	// but do NOT write the filter file or pin any maps.
-	sd := stateDir(hp)
-	if err := os.MkdirAll(sd, 0700); err != nil {
-		t.Fatal(err)
-	}
-	pidFile := subPIDPath(hp, 0)
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
-		t.Fatal(err)
-	}
+	// Pin a PID for slot 0 (our own PID), but do NOT pin the filter or any maps.
+	pinPartialSlot(t, hp, 0)
 
 	// A new subscriber must succeed by reclaiming the incomplete slot.
 	opts := testOpts(bpf.RetConstant{Val: 3})
@@ -399,19 +390,29 @@ func TestPartialRegistrationReclaimed(t *testing.T) {
 	f.close()
 }
 
-// TestStateDirInjective verifies that hook paths differing only by '.' vs '_'
-// (or other previously-colliding characters) produce distinct state dirs.
-func TestStateDirInjective(t *testing.T) {
-	cases := [][2]string{
-		{"/sys/fs/bpf/hook_test", "/sys/fs/bpf/hook.test"},
-		{"/sys/fs/bpf/a_b", "/sys/fs/bpf/a.b"},
-		{"/sys/fs/bpf/x__y", "/sys/fs/bpf/x_y"},
+// TestStateNotInTmp verifies that registering a subscriber keeps all state on
+// bpffs and never creates world-reachable files under /tmp.
+func TestStateNotInTmp(t *testing.T) {
+	before, err := filepath.Glob("/tmp/xdpcap_*")
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, pair := range cases {
-		a, b := stateDir(pair[0]), stateDir(pair[1])
-		if a == b {
-			t.Errorf("stateDir collision: %q and %q both → %q", pair[0], pair[1], a)
+
+	f := mustNew(t, testOpts(bpf.RetConstant{Val: 3}))
+	defer f.close()
+
+	for _, p := range []string{subPIDPath(f.hookPath, f.slot), subFilterPath(f.hookPath, f.slot), subPerfPath(f.hookPath, f.slot)} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("missing bpffs state %s: %v", p, err)
 		}
+	}
+
+	after, err := filepath.Glob("/tmp/xdpcap_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Errorf("subscriber created state under /tmp: %v", after)
 	}
 }
 
@@ -518,6 +519,20 @@ func hookMap(t *testing.T, entries int) *ebpf.Map {
 	t.Cleanup(func() { hookMap.Close() })
 
 	return hookMap
+}
+
+// pinPartialSlot simulates a subscriber that crashed right after claiming slot.
+func pinPartialSlot(t *testing.T, hookPath string, slot int) {
+	t.Helper()
+
+	if err := os.MkdirAll(slotDir(hookPath, slot), 0700); err != nil {
+		t.Fatal(err)
+	}
+	pid := make([]byte, 4)
+	nativeEndian.PutUint32(pid, uint32(os.Getpid()))
+	if err := pinValue(subPIDPath(hookPath, slot), "xdpcap_pid", pid); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func mustNew(t *testing.T, opts filterOpts) *filter {
