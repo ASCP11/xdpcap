@@ -173,8 +173,9 @@ type flags struct {
 	mapPath  string
 	pcapFile *os.File
 
-	quiet bool
-	flush bool
+	quiet   bool
+	flush   bool
+	cleanup bool
 
 	linkType layers.LinkType
 
@@ -204,6 +205,7 @@ func parseFlags(name string, args []string) (flags, error) {
 	flags.BoolVar(&flags.flush, "flush", false, "Flush pcap data written to <output> for every packet received")
 	flags.Uint64Var(&flags.packetLimit, "c", 0, "Exit after capturing `count` packets (0 = unlimited)")
 	flags.Uint64Var(&flags.sizeLimit, "C", 0, "Exit after capturing approximately `megabytes` MB of data (0 = unlimited)")
+	flags.BoolVar(&flags.cleanup, "cleanup", false, "Remove state left on <debug map> by captures that were killed, then exit. Only <debug map> is required")
 
 	flags.filterOpts.actions = []xdpAction{}
 	flags.Var((*actionsFlag)(&flags.filterOpts.actions), "actions", fmt.Sprintf("XDP `actions` to capture packets for. Comma separated list of names (%v) or enum values (default all actions exposed by the <debug map>)", xdpActions))
@@ -214,6 +216,14 @@ func parseFlags(name string, args []string) (flags, error) {
 	err := flags.Parse(args)
 	if err != nil {
 		return flags, err
+	}
+
+	if flags.cleanup {
+		if flags.NArg() != 1 {
+			return flags, errors.New("-cleanup takes only <debug map>")
+		}
+		flags.mapPath = flags.Arg(0)
+		return flags, nil
 	}
 
 	if flags.NArg() < 2 {
@@ -249,6 +259,7 @@ func (flags flags) Usage() string {
 
 	usage.WriteString(fmt.Sprintf(
 		`%s [options] <debug map> <output> [<filter expr>]
+%[1]s -cleanup <debug map>
 
 Capture packets from XDP programs matching a tcpdump / libpcap filter expression, <filter expr>.
 <filter expr> can also be a classic BPF filter of the form '<op count>,<op> <jt> <jf> <k>,...'.

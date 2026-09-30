@@ -511,6 +511,81 @@ func TestCanonicalHookPath(t *testing.T) {
 	}
 }
 
+// TestCleanupHook verifies that cleanupHook drops a killed subscriber from the
+// coordinator while keeping live ones, and removes the coordinator once none
+// are left.
+func TestCleanupHook(t *testing.T) {
+	hp := bpfTempPath(t)
+	hm := hookMap(t, 4)
+	if err := hm.Pin(hp); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(hp) })
+
+	killed, err := newFilterWithMap(hm, hp, testOpts(bpf.RetConstant{Val: 3}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer killed.close()
+
+	live, err := newFilterWithMap(hm, hp, testOpts(matchByte(0, 0xde)...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.close()
+
+	// Releasing the slot lock is what the kernel does when a process is killed.
+	killed.slotLock.Close()
+
+	n, err := cleanupHook(hp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 live subscriber, got %d", n)
+	}
+	if _, err := os.Stat(slotDir(hp, killed.slot)); !os.IsNotExist(err) {
+		t.Fatalf("killed subscriber's slot not removed: %v", err)
+	}
+
+	// The installed coordinator must only feed the live subscriber now.
+	var id uint32
+	if err := hm.Lookup(int32(xdpPass), &id); err != nil {
+		t.Fatal(err)
+	}
+	prog, err := ebpf.NewProgramFromID(ebpf.ProgramID(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prog.Close()
+	pkt := make([]byte, 14)
+	pkt[0] = 0xde
+	if _, _, err := prog.Test(pkt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := live.read(); err != nil {
+		t.Fatal("live subscriber:", err)
+	}
+	m, err := killed.metrics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m[xdpPass].receivedPackets != 0 {
+		t.Fatal("killed subscriber still fed by coordinator")
+	}
+
+	// Once the last subscriber is gone, cleanup removes the coordinator.
+	live.slotLock.Close()
+	if n, err := cleanupHook(hp); err != nil || n != 0 {
+		t.Fatalf("cleanupHook = %d, %v", n, err)
+	}
+	for a := 0; a < 4; a++ {
+		if err := hm.Lookup(int32(a), &id); err == nil {
+			t.Errorf("coordinator still installed for action %v", xdpAction(a))
+		}
+	}
+}
+
 // checkActions checks that all coordinator programs return their expected action.
 func checkActions(t *testing.T, actions []xdpAction, f *filter, in []byte) {
 	t.Helper()

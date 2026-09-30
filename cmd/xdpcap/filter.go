@@ -280,24 +280,10 @@ func (f *filter) close() error {
 				}
 			}()
 
-			if len(remaining) == 0 {
-				// Sweep the entire hook map, not just f.actions: other subscribers
-				// may have installed coordinators for actions this subscriber never
-				// watched, and those pass-throughs must also be cleaned up.
-				if err := removeCoordinator(f.hookMap, allActions(f.hookMap)); err != nil {
-					return err
-				}
-				os.Remove(coordinatorModePath(f.hookPath))
-				return nil
-			}
-
-			newProgs, err := reinstallCoordinator(f.hookMap, remaining, f.actions, f.xdpFrags, f.xdpAttach)
-			// Close the returned program FDs: the kernel holds its own references via
-			// the hook map; userspace no longer needs them after the Put calls succeed.
-			for _, p := range newProgs {
-				p.Close()
-			}
-			return errors.Wrap(err, "reinstalling coordinator after unsubscribe")
+			return errors.Wrap(
+				syncCoordinator(f.hookMap, f.hookPath, remaining, f.actions, f.xdpFrags, f.xdpAttach),
+				"reinstalling coordinator after unsubscribe",
+			)
 		})
 		if err != nil {
 			lastErr = err
@@ -321,6 +307,83 @@ func (f *filter) close() error {
 	}
 
 	return lastErr
+}
+
+// syncCoordinator makes the coordinator in hookMap serve exactly subs for
+// actions, removing it altogether when there are no subscribers left.
+// The caller must hold the subscriber lock.
+func syncCoordinator(hookMap *ebpf.Map, hookPath string, subs []loadedSub, actions []xdpAction, xdpFrags, xdpAttach bool) error {
+	if len(subs) == 0 {
+		// Sweep the entire hook map, not just actions: other subscribers may have
+		// installed coordinators for actions never listed here, and those
+		// pass-throughs must also be cleaned up.
+		if err := removeCoordinator(hookMap, allActions(hookMap)); err != nil {
+			return err
+		}
+		os.Remove(coordinatorModePath(hookPath))
+		return nil
+	}
+
+	newProgs, err := reinstallCoordinator(hookMap, subs, actions, xdpFrags, xdpAttach)
+	// Close the returned program FDs: the kernel holds its own references via
+	// the hook map; userspace no longer needs them after the Put calls succeed.
+	for _, p := range newProgs {
+		p.Close()
+	}
+	return err
+}
+
+// cleanupHook removes the state of subscribers that exited without
+// unregistering, such as killed processes, and rebuilds the coordinator for the
+// live ones. It returns the number of live subscribers.
+func cleanupHook(hookMapPath string) (int, error) {
+	hookPath, err := canonicalHookPath(hookMapPath)
+	if err != nil {
+		return 0, errors.Wrap(err, "resolving hook map path")
+	}
+
+	hookMap, err := ebpf.LoadPinnedMap(hookPath, nil)
+	if err != nil {
+		return 0, errors.Wrap(err, "loading hook map")
+	}
+	defer hookMap.Close()
+
+	if err := internal.CheckHookMap(hookMap); err != nil {
+		return 0, errors.Wrap(err, "invalid hook map ABI")
+	}
+
+	var live int
+	err = withSubsLock(hookPath, func() error {
+		// Loading purges stale subscribers.
+		subs, err := loadAllSubscribers(hookPath)
+		if err != nil {
+			return errors.Wrap(err, "loading subscribers")
+		}
+		defer func() {
+			for _, s := range subs {
+				s.close()
+			}
+		}()
+		live = len(subs)
+
+		frags, attach, err := readCoordinatorMode(hookPath)
+		if err != nil && live > 0 {
+			progs, frags, attach, err := installCoordinator(hookMap, subs, allActions(hookMap))
+			if err != nil {
+				return errors.Wrap(err, "reinstalling coordinator")
+			}
+			for _, p := range progs {
+				p.Close()
+			}
+			return writeCoordinatorMode(hookPath, frags, attach)
+		}
+
+		return errors.Wrap(
+			syncCoordinator(hookMap, hookPath, subs, allActions(hookMap), frags, attach),
+			"reinstalling coordinator",
+		)
+	})
+	return live, err
 }
 
 var errFilterClosed = errors.New("filter closed")

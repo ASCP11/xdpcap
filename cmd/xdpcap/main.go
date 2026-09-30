@@ -44,6 +44,17 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n\nUsage: %s", err, flags.Usage())
 		os.Exit(1)
 	}
+
+	if flags.cleanup {
+		live, err := cleanupHook(flags.mapPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(2)
+		}
+		fmt.Fprintf(os.Stderr, "%d live capture(s) remain\n", live)
+		os.Exit(0)
+	}
+
 	defer flags.pcapFile.Close()
 
 	err = capture(flags)

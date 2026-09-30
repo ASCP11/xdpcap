@@ -35,6 +35,24 @@ func TestRequiredArgs(t *testing.T) {
 	requireFlags(t, output, defaultFlags("foo"), flags)
 }
 
+func TestCleanupArgs(t *testing.T) {
+	flags, err := parseFlags("", []string{"-cleanup", "foo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !flags.cleanup || flags.mapPath != "foo" || flags.pcapFile != nil {
+		t.Fatalf("unexpected flags %+v", flags)
+	}
+
+	if _, err := parseFlags("", []string{"-cleanup"}); err == nil {
+		t.Fatal("missing debug map accepted")
+	}
+
+	if _, err := parseFlags("", []string{"-cleanup", "foo", tempOutput(t)}); err == nil {
+		t.Fatal("extra args accepted")
+	}
+}
+
 func TestOutputInvalid(t *testing.T) {
 	_, err := parseFlags("", []string{"foo", "/"})
 	if err == nil {

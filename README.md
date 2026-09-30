@@ -163,8 +163,14 @@ sets. A shared coordinator BPF program (rebuilt whenever a subscriber joins or
 leaves) fans packets to every active subscriber whose filter matches.
 
 The coordinator is installed automatically on first attach and removed when the
-last subscriber exits. Stale subscriber state from crashed processes is cleaned
-up automatically.
+last subscriber exits. A capture that is killed (e.g. `SIGKILL`) can't
+unregister, so its filter keeps running on every packet until the next xdpcap
+attaches to or detaches from the same hook and cleans it up. To clean up right
+away, run:
+
+```bash
+xdpcap -cleanup /path/to/pinned/map
+```
 
 Subscriber state is pinned on bpffs next to the hook map, in `<debug map>_subs/`,
 so it is only accessible to privileged users and shared by every process that
