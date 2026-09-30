@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/ASCP11/xdpcap/internal"
@@ -475,6 +476,10 @@ func TestCloseRemovesAllHookMapEntries(t *testing.T) {
 		t.Fatal("f2 close:", err)
 	}
 
+	if _, err := os.Stat(bpffsDir(hp)); !os.IsNotExist(err) {
+		t.Errorf("subscriber dir left behind after all subscribers closed: %v", err)
+	}
+
 	// Hook map must have no remaining entries.
 	for _, a := range []xdpAction{xdpAborted, xdpDrop, xdpPass, xdpTx} {
 		var fd int32
@@ -580,6 +585,49 @@ func TestCleanupHook(t *testing.T) {
 		t.Fatalf("cleanupHook = %d, %v", n, err)
 	}
 	for a := 0; a < 4; a++ {
+		if err := hm.Lookup(int32(a), &id); err == nil {
+			t.Errorf("coordinator still installed for action %v", xdpAction(a))
+		}
+	}
+}
+
+// TestConcurrentJoinLeave has subscribers repeatedly join and leave the same
+// hook in parallel, so the last one out keeps removing the subscriber dir while
+// others are waiting to lock it.
+func TestConcurrentJoinLeave(t *testing.T) {
+	hm := hookMap(t, 4)
+	hp := bpfTempPath(t)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				f, err := newFilterWithMap(hm, hp, testOpts(bpf.RetConstant{Val: 3}))
+				if err != nil {
+					errs <- err
+					return
+				}
+				if err := f.close(); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	if _, err := os.Stat(bpffsDir(hp)); !os.IsNotExist(err) {
+		t.Errorf("subscriber dir left behind: %v", err)
+	}
+	for a := 0; a < 4; a++ {
+		var id uint32
 		if err := hm.Lookup(int32(a), &id); err == nil {
 			t.Errorf("coordinator still installed for action %v", xdpAction(a))
 		}

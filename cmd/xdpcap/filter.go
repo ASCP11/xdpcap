@@ -321,6 +321,8 @@ func syncCoordinator(hookMap *ebpf.Map, hookPath string, subs []loadedSub, actio
 			return err
 		}
 		os.Remove(coordinatorModePath(hookPath))
+		// Fails harmlessly if a slot dir is still there, e.g. a partial one.
+		os.Remove(bpffsDir(hookPath))
 		return nil
 	}
 

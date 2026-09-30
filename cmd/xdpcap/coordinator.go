@@ -134,22 +134,56 @@ func subFilterPath(hookPath string, slot int) string {
 // withSubsLock runs fn under an exclusive flock on bpffsDir, creating it if absent.
 func withSubsLock(hookPath string, fn func() error) error {
 	dir := bpffsDir(hookPath)
+	for {
+		f, err := lockDir(dir)
+		if err != nil {
+			return err
+		}
+		if f == nil {
+			// The last subscriber removed dir while we waited: start over.
+			continue
+		}
+		defer f.Close()
+
+		return fn()
+	}
+}
+
+// lockDir creates dir if needed and returns it open and exclusively flock'd.
+// It returns nil if dir was removed before the lock was acquired.
+func lockDir(dir string) (*os.File, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		return errors.Wrap(err, "creating bpffs dir")
+		return nil, errors.Wrap(err, "creating bpffs dir")
 	}
 
 	f, err := os.Open(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
 	if err != nil {
-		return errors.Wrap(err, "opening bpffs dir for lock")
+		return nil, errors.Wrap(err, "opening bpffs dir for lock")
 	}
-	defer f.Close()
 
+	// Closing f releases the lock.
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return errors.Wrap(err, "acquiring subscriber lock")
+		f.Close()
+		return nil, errors.Wrap(err, "acquiring subscriber lock")
 	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
 
-	return fn()
+	// Make sure we locked the dir that is still at that path, not one that was
+	// removed while we were blocked.
+	locked, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, errors.Wrap(err, "stat bpffs dir")
+	}
+	current, err := os.Stat(dir)
+	if err != nil || !os.SameFile(locked, current) {
+		f.Close()
+		return nil, nil
+	}
+
+	return f, nil
 }
 
 // slotAlive reports whether slot is held by a running process.
