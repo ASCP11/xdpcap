@@ -79,13 +79,25 @@ func capture(flags flags) error {
 	defer pcapWriter.Flush()
 	defer filter.close()
 
-	if !flags.quiet {
+	stopMetrics := make(chan struct{})
+	metricsDone := make(chan struct{})
+
+	if flags.quiet {
+		close(metricsDone)
+	} else {
 		// Print metrics every 1 second
 		go func() {
+			defer close(metricsDone)
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 
-			for range ticker.C {
+			for {
+				select {
+				case <-stopMetrics:
+					return
+				case <-ticker.C:
+				}
+
 				str := bytes.Buffer{}
 
 				metrics, err := filter.metrics()
@@ -163,10 +175,17 @@ func capture(flags flags) error {
 
 	select {
 	case <-sigs:
-		return nil
 	case <-done:
-		return nil
 	}
+
+	// Stop both goroutines before the deferred flush and filter teardown, which
+	// would otherwise race with them.
+	close(stopMetrics)
+	filter.stopReading()
+	<-done
+	<-metricsDone
+
+	return nil
 }
 
 // newPcapWriter creates a pcapWriter with an pcap interface (metadata) per xdp action

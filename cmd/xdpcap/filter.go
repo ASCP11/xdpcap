@@ -325,6 +325,11 @@ func (f *filter) close() error {
 
 var errFilterClosed = errors.New("filter closed")
 
+// stopReading makes pending and future read() calls return errFilterClosed.
+func (f *filter) stopReading() {
+	f.reader.Close()
+}
+
 func (f *filter) read() (packet, error) {
 	record, err := f.reader.Read()
 	switch {
