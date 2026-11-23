@@ -167,6 +167,10 @@ func parseInstruction(insnStr string) (bpf.Instruction, error) {
 	return rawInsn.Disassemble(), nil
 }
 
+// maxSnaplen is the largest accepted -snaplen, the usual libpcap maximum
+// snapshot length for Ethernet.
+const maxSnaplen = 65535
+
 type flags struct {
 	*flag.FlagSet
 
@@ -186,6 +190,8 @@ type flags struct {
 	// Capture limits
 	packetLimit uint64 // Maximum number of packets to capture (0 = unlimited)
 	sizeLimit   uint64 // Maximum capture size in megabytes (0 = unlimited)
+
+	snaplen int // Bytes captured per packet (0 = whole packet), see filterOpts.snaplen
 }
 
 // parseFlags creates the flags, and attempts to parse args.
@@ -205,6 +211,7 @@ func parseFlags(name string, args []string) (flags, error) {
 	flags.BoolVar(&flags.flush, "flush", false, "Flush pcap data written to <output> for every packet received")
 	flags.Uint64Var(&flags.packetLimit, "c", 0, "Exit after capturing `count` packets (0 = unlimited)")
 	flags.Uint64Var(&flags.sizeLimit, "C", 0, "Exit after capturing approximately `megabytes` MB of data (0 = unlimited)")
+	flags.IntVar(&flags.snaplen, "snaplen", 0, fmt.Sprintf("Capture at most `bytes` of each packet, 0 to %d. The packet is truncated in the kernel before it is copied to the perf buffer. 0 captures whole packets", maxSnaplen))
 	flags.BoolVar(&flags.cleanup, "cleanup", false, "Remove state left on <debug map> by captures that were killed, then exit. Only <debug map> is required")
 
 	flags.filterOpts.actions = []xdpAction{}
@@ -217,6 +224,11 @@ func parseFlags(name string, args []string) (flags, error) {
 	if err != nil {
 		return flags, err
 	}
+
+	if flags.snaplen < 0 || flags.snaplen > maxSnaplen {
+		return flags, errors.Errorf("-snaplen must be between 0 and %d, got %d", maxSnaplen, flags.snaplen)
+	}
+	flags.filterOpts.snaplen = uint32(flags.snaplen)
 
 	if flags.cleanup {
 		if flags.NArg() != 1 {

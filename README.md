@@ -121,7 +121,8 @@ all packets. You can also pass a raw cBPF string in the form
 | `-buffer <bytes>` | 8192 | Per-CPU perf ring-buffer size |
 | `-watermark <bytes>` | 1 | Perf wakeup watermark |
 | `-c <count>` | unlimited | Stop after capturing this many packets |
-| `-C <MB>` | unlimited | Stop after capturing approximately this many megabytes |
+| `-C <MB>` | unlimited | Stop after capturing approximately this many megabytes (captured bytes, after `-snaplen`) |
+| `-snaplen <bytes>` | 0 (whole packet) | Capture at most this many bytes of each packet, 0 to 65535 |
 | `-flush` | off | Flush output after every packet (implied when writing to stdout) |
 | `-linktype <type>` | ethernet | Link type for filter compilation |
 | `-q` | off | Quiet — suppress per-second statistics |
@@ -149,10 +150,34 @@ sudo xdpcap /sys/fs/bpf/my_hook all.pcapng &
 sudo xdpcap /sys/fs/bpf/my_hook icmp-only.pcapng "icmp"
 ```
 
+Capture only the first 128 bytes of each packet (headers), to keep up with
+high packet rates:
+```bash
+sudo xdpcap -snaplen 128 /sys/fs/bpf/my_hook headers.pcapng
+```
+
 Stop after 1000 packets or 10 MB, whichever comes first:
 ```bash
 sudo xdpcap -c 1000 -C 10 /sys/fs/bpf/my_hook capture.pcapng
 ```
+
+
+## Snaplen
+
+`-snaplen` truncates packets in the coordinator BPF program: only the first
+`<bytes>` of each packet are copied to the perf buffer, along with its original
+length. This reduces the per-CPU perf buffer usage (and lost samples) at high
+packet rates, not just the output size. Each sample takes about
+`min(packet length, snaplen) + 32` bytes of the `-buffer`.
+
+The filter still runs on the whole packet. In the pcapng output, each packet's
+captured length is the truncated size, its original length is the size of the
+packet, and the interfaces' snap length is `<bytes>` (65535 without
+`-snaplen`).
+
+Each capture has its own snaplen, so concurrent captures on the same hook can
+use different values. If the coordinator was built by an xdpcap version without
+`-snaplen` support, packets are copied whole and truncated when written.
 
 
 ## Multi-capture

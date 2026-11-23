@@ -16,7 +16,8 @@ import (
 
 type packet struct {
 	action xdpAction
-	data   []byte
+	data   []byte // captured bytes, possibly truncated to the snaplen
+	length int    // original length of the packet
 }
 
 var perfMapSpec = ebpf.MapSpec{
@@ -27,6 +28,9 @@ var perfMapSpec = ebpf.MapSpec{
 type filterOpts struct {
 	perfPerCPUBuffer int
 	perfWatermark    int
+
+	// Maximum bytes of each packet copied to the perf ring, 0 = whole packet.
+	snaplen uint32
 
 	// Requested actions. If empty or nil, all actions exposed by hookMap are used.
 	actions []xdpAction
@@ -41,6 +45,7 @@ type filter struct {
 	slot         int
 	slotLock     *os.File // open slot dir, flock'd while this subscriber is alive
 	reader       *perf.Reader
+	snaplen      uint32
 	perfMap      *ebpf.Map
 	programs     map[xdpAction]*program // coordinator progs + this subscriber's metrics maps
 	actions      []xdpAction
@@ -141,6 +146,7 @@ func newFilterWithMap(hookMap *ebpf.Map, hookPath string, opts filterOpts) (*fil
 		hookPath: hookPath,
 		slot:     -1,
 		reader:   reader,
+		snaplen:  opts.snaplen,
 		perfMap:  perfMap,
 		actions:  actions,
 	}
@@ -162,7 +168,7 @@ func newFilterWithMap(hookMap *ebpf.Map, hookPath string, opts filterOpts) (*fil
 		}()
 
 		// Claim a slot.
-		slot, slotLock, err := registerSubscriber(hookPath, opts.filter, perfMap, metricsMaps)
+		slot, slotLock, err := registerSubscriber(hookPath, opts.filter, opts.snaplen, perfMap, metricsMaps)
 		if err != nil {
 			return err
 		}
@@ -172,7 +178,7 @@ func newFilterWithMap(hookMap *ebpf.Map, hookPath string, opts filterOpts) (*fil
 		// loadedSub for this subscriber using the already-open in-memory maps.
 		// Note: this subscriber's maps are owned by f and must NOT be closed here;
 		// only the incumbents in existing are closed by the deferred loop above.
-		selfSub := loadedSub{slot: slot, filter: opts.filter, perfMap: perfMap, metricsMaps: metricsMaps}
+		selfSub := loadedSub{slot: slot, filter: opts.filter, snaplen: opts.snaplen, perfMap: perfMap, metricsMaps: metricsMaps}
 		allSubs := append(existing, selfSub)
 
 		if len(existing) == 0 {
@@ -408,20 +414,41 @@ func (f *filter) read() (packet, error) {
 		return packet{}, errors.Errorf("lost %d packets", record.LostSamples)
 	}
 
-	raw := record.RawSample
+	return parseSample(record.RawSample, f.snaplen)
+}
+
+// parseSample decodes a perf sample written by the coordinator, see perfOutputInsns.
+func parseSample(raw []byte, snaplen uint32) (packet, error) {
 	if len(raw) < 16 {
 		return packet{}, errors.New("perf packet data < 16 bytes")
 	}
 
-	action := xdpAction(nativeEndian.Uint64(raw[:8]))
-	length := int(nativeEndian.Uint64(raw[8:16]))
+	word := nativeEndian.Uint64(raw[:8])
+	action := xdpAction(uint32(word))
+	capLen := int(nativeEndian.Uint64(raw[8:16]))
 	data := raw[16:]
 
-	if len(data) < length {
+	if len(data) < capLen {
 		return packet{}, errors.New("perf packet truncated")
 	}
+	data = data[:capLen]
 
-	return packet{action: action, data: data[:length]}, nil
+	// The original length is only sent along when the coordinator truncates.
+	length := int(word >> 32)
+	if length == 0 {
+		length = capLen
+	}
+	if length < capLen {
+		return packet{}, errors.Errorf("perf packet length %d < captured length %d", length, capLen)
+	}
+
+	// A coordinator built by an xdpcap without snaplen support sends whole
+	// packets: truncate here instead.
+	if snaplen > 0 && len(data) > int(snaplen) {
+		data = data[:snaplen]
+	}
+
+	return packet{action: action, data: data, length: length}, nil
 }
 
 func (f *filter) metrics() (map[xdpAction]metrics, error) {

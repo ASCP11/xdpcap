@@ -26,7 +26,11 @@ const maxSubscribers = 16
 //
 //	[R10-4,  R10-1]   u32 metrics map key
 //	[R10-16, R10-9]   u64 action (raw[0:8] in the perf record)
-//	[R10-8,  R10-1]   u64 packet length (raw[8:16] in the perf record)
+//	[R10-8,  R10-1]   u64 captured length (raw[8:16] in the perf record)
+//
+// For subscribers with a snaplen, the upper 32 bits of the action word carry
+// the original packet length, see perfHeader. Without a snaplen the header is
+// exactly the original layout, so older readers sharing the hook still work.
 //
 // The perf header overwrites the map key. That is safe because the key is
 // stored again right before every lookup, and the header is written after it.
@@ -98,6 +102,7 @@ func (p *program) metrics() (metrics, error) {
 //	<hookPath>_subs/mode                coordinator load flags
 //	<hookPath>_subs/<slot>/             flock'd (shared) by its subscriber while alive
 //	<hookPath>_subs/<slot>/filter       serialized cBPF filter
+//	<hookPath>_subs/<slot>/snaplen      u32 snaplen (absent = 0, whole packet)
 //	<hookPath>_subs/<slot>/perf         perf event array
 //	<hookPath>_subs/<slot>/metrics_<a>  per-CPU metrics for action a
 //
@@ -124,6 +129,11 @@ const metricsPinPrefix = "metrics_"
 // subMetricsPath is the bpffs pin path for a subscriber's metrics map for one action.
 func subMetricsPath(hookPath string, slot int, action xdpAction) string {
 	return filepath.Join(slotDir(hookPath, slot), fmt.Sprintf("%s%d", metricsPinPrefix, int(action)))
+}
+
+// subSnaplenPath is the bpffs pin path for a subscriber's snaplen.
+func subSnaplenPath(hookPath string, slot int) string {
+	return filepath.Join(slotDir(hookPath, slot), "snaplen")
 }
 
 // subFilterPath is the bpffs pin path for a subscriber's serialized cBPF filter.
@@ -245,6 +255,30 @@ func readPinnedValue(path string) ([]byte, error) {
 	return value, nil
 }
 
+// ---- snaplen serialization ----
+
+func writeSnaplen(path string, snaplen uint32) error {
+	raw := make([]byte, 4)
+	nativeEndian.PutUint32(raw, snaplen)
+	return pinValue(path, "xdpcap_snaplen", raw)
+}
+
+// readSnaplen returns the snaplen pinned at path. Slots registered by xdpcap
+// versions without snaplen support have no pin: they capture whole packets.
+func readSnaplen(path string) (uint32, error) {
+	raw, err := readPinnedValue(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if len(raw) != 4 {
+		return 0, errors.Errorf("%s: unexpected size", path)
+	}
+	return nativeEndian.Uint32(raw), nil
+}
+
 // ---- filter serialization ----
 
 func writeFilter(path string, filter []bpf.Instruction) error {
@@ -289,6 +323,7 @@ func readFilter(path string) ([]bpf.Instruction, error) {
 type loadedSub struct {
 	slot        int
 	filter      []bpf.Instruction
+	snaplen     uint32 // bytes copied to the perf ring per packet, 0 = whole packet
 	perfMap     *ebpf.Map
 	metricsMaps map[xdpAction]*ebpf.Map
 }
@@ -307,6 +342,7 @@ func (s *loadedSub) close() {
 func registerSubscriber(
 	hookPath string,
 	filter []bpf.Instruction,
+	snaplen uint32,
 	perfMap *ebpf.Map,
 	metricsMaps map[xdpAction]*ebpf.Map,
 ) (int, *os.File, error) {
@@ -340,6 +376,12 @@ func registerSubscriber(
 	}
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
 		return fail(errors.Wrap(err, "locking slot dir"))
+	}
+
+	// Before the filter: a slot with a filter but no snaplen was registered by
+	// an older xdpcap, and gets the whole packet.
+	if err := writeSnaplen(subSnaplenPath(hookPath, slot), snaplen); err != nil {
+		return fail(errors.Wrap(err, "pinning snaplen"))
 	}
 
 	if err := writeFilter(subFilterPath(hookPath, slot), filter); err != nil {
@@ -398,6 +440,12 @@ func loadAllSubscribers(hookPath string) ([]loadedSub, error) {
 			return nil, errors.Wrapf(err, "loading filter for slot %d", i)
 		}
 
+		snaplen, err := readSnaplen(subSnaplenPath(hookPath, i))
+		if err != nil {
+			closeAll()
+			return nil, errors.Wrapf(err, "loading snaplen for slot %d", i)
+		}
+
 		perfMap, err := ebpf.LoadPinnedMap(subPerfPath(hookPath, i), nil)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -433,6 +481,7 @@ func loadAllSubscribers(hookPath string) ([]loadedSub, error) {
 		subs = append(subs, loadedSub{
 			slot:        i,
 			filter:      filter,
+			snaplen:     snaplen,
 			perfMap:     perfMap,
 			metricsMaps: metricsMaps,
 		})
@@ -533,23 +582,10 @@ func generateCoordinatorInsns(subs []loadedSub, action xdpAction) (asm.Instructi
 			asm.LoadMem(asm.R2, asm.R7, int16(8*matchedPackets), asm.DWord),
 			asm.Add.Imm(asm.R2, 1),
 			asm.StoreMem(asm.R7, int16(8*matchedPackets), asm.R2, asm.DWord),
-
-			// bpf_perf_event_output(ctx, perf_map, flags, header_ptr, sizeof_header)
-			asm.Mov.Reg(asm.R1, asm.R6),                        // ctx
-			asm.LoadMapPtr(asm.R2, sub.perfMap.FD()),            // perf map
-			asm.Mov.Reg(asm.R3, asm.R8),                        // pkt_len → flags
-			asm.LSh.Imm(asm.R3, 32),
-			asm.LoadImm(asm.R0, BPF_F_CURRENT_CPU, asm.DWord),
-			asm.Or.Reg(asm.R3, asm.R0),
-			// Build header: [R10-8] = length, [R10-16] = action.
-			asm.Mov.Reg(asm.R4, asm.R10),
-			asm.Add.Imm(asm.R4, -8),
-			asm.StoreMem(asm.R4, 0, asm.R8, asm.DWord),
-			asm.Add.Imm(asm.R4, -8),
-			asm.StoreImm(asm.R4, 0, int64(action), asm.DWord),
-			asm.Mov.Imm(asm.R5, 2*8),
-			asm.FnPerfEventOutput.Call(),
-
+		}
+		// bpf_perf_event_output(ctx, perf_map, flags, header_ptr, sizeof_header)
+		resultSection = append(resultSection, perfOutputInsns(sub.perfMap.FD(), action, sub.snaplen, fmt.Sprintf("s%d_caplen", i))...)
+		resultSection = append(resultSection,
 			// Success: jump to next subscriber.
 			asm.JEq.Imm(asm.R0, 0, next),
 
@@ -558,7 +594,7 @@ func generateCoordinatorInsns(subs []loadedSub, action xdpAction) (asm.Instructi
 			asm.Add.Imm(asm.R2, 1),
 			asm.StoreMem(asm.R7, int16(8*perfOutputErrors), asm.R2, asm.DWord),
 			// Fall through to next subscriber (or exit).
-		}
+		)
 
 		insns = append(insns, metricsSection...)
 		insns = append(insns, filterInsns...)
@@ -572,6 +608,65 @@ func generateCoordinatorInsns(subs []loadedSub, action xdpAction) (asm.Instructi
 	)
 
 	return insns, nil
+}
+
+// perfOutputInsns emits the bpf_perf_event_output call for one subscriber.
+// It expects R6 = ctx and R8 = packet length, and leaves the helper's result in R0.
+//
+// The number of packet bytes copied to the perf ring (the upper 32 bits of the
+// flags argument) is min(packet length, snaplen), so a snaplen relieves the
+// ring rather than just the output file. capLabel must be unique in the program.
+//
+// Header written below R10, see stackReserved:
+//
+//	snaplen == 0:  [R10-16] = action                    [R10-8] = packet length
+//	snaplen  > 0:  [R10-16] = action | packet length<<32 [R10-8] = captured length
+func perfOutputInsns(perfMapFD int, action xdpAction, snaplen uint32, capLabel string) asm.Instructions {
+	// capLen is the register holding the captured length.
+	capLen := asm.R8
+	var insns asm.Instructions
+	setCtx := asm.Mov.Reg(asm.R1, asm.R6) // ctx
+
+	if snaplen > 0 {
+		// R9 = min(R8, snaplen). R9 is callee-saved and otherwise unused.
+		capLen = asm.R9
+		insns = append(insns,
+			asm.Mov.Reg(asm.R9, asm.R8),
+			asm.JLE.Imm(asm.R9, int32(snaplen), capLabel),
+			asm.Mov.Imm(asm.R9, int32(snaplen)),
+		)
+		setCtx = setCtx.WithSymbol(capLabel)
+	}
+
+	insns = append(insns,
+		setCtx,
+		asm.LoadMapPtr(asm.R2, perfMapFD), // perf map
+		asm.Mov.Reg(asm.R3, capLen),       // captured length → flags
+		asm.LSh.Imm(asm.R3, 32),
+		asm.LoadImm(asm.R0, BPF_F_CURRENT_CPU, asm.DWord),
+		asm.Or.Reg(asm.R3, asm.R0),
+		// Build header: [R10-8] = captured length, [R10-16] = action.
+		asm.Mov.Reg(asm.R4, asm.R10),
+		asm.Add.Imm(asm.R4, -8),
+		asm.StoreMem(asm.R4, 0, capLen, asm.DWord),
+		asm.Add.Imm(asm.R4, -8),
+	)
+	if snaplen > 0 {
+		// R0 = packet length<<32 | action
+		insns = append(insns,
+			asm.Mov.Reg(asm.R0, asm.R8),
+			asm.LSh.Imm(asm.R0, 32),
+			asm.Or.Imm(asm.R0, int32(action)),
+			asm.StoreMem(asm.R4, 0, asm.R0, asm.DWord),
+		)
+	} else {
+		insns = append(insns, asm.StoreImm(asm.R4, 0, int64(action), asm.DWord))
+	}
+
+	return append(insns,
+		asm.Mov.Imm(asm.R5, 2*8),
+		asm.FnPerfEventOutput.Call(),
+	)
 }
 
 // buildCoordinatorPrograms generates and loads one coordinator *ebpf.Program per XDP action.

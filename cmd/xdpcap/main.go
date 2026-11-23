@@ -82,7 +82,7 @@ func capture(flags flags) error {
 
 	// Need to close the filter after the pcap writer
 
-	pcapWriter, interfaces, err := newPcapWriter(flags.pcapFile, flags.filterExpr, filter.actions)
+	pcapWriter, interfaces, err := newPcapWriter(flags.pcapFile, flags.filterExpr, filter.actions, flags.filterOpts.snaplen)
 	if err != nil {
 		filter.close()
 		return errors.Wrap(err, "writing pcap header")
@@ -160,14 +160,7 @@ func capture(flags flags) error {
 				continue
 			}
 
-			info := gopacket.CaptureInfo{
-				Timestamp:      time.Now(),
-				CaptureLength:  len(pkt.data),
-				Length:         len(pkt.data),
-				InterfaceIndex: interfaces[pkt.action],
-			}
-
-			err = pcapWriter.WritePacket(info, pkt.data)
+			err = pcapWriter.WritePacket(captureInfo(pkt, time.Now(), interfaces), pkt.data)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "Error writing packet:", err)
 			}
@@ -199,10 +192,25 @@ func capture(flags flags) error {
 	return nil
 }
 
-// newPcapWriter creates a pcapWriter with an pcap interface (metadata) per xdp action
-func newPcapWriter(w io.Writer, filterExpr string, actions []xdpAction) (*pcapgo.NgWriter, map[xdpAction]int, error) {
+// captureInfo describes pkt, which may be truncated, for the pcap writer.
+func captureInfo(pkt packet, ts time.Time, interfaces map[xdpAction]int) gopacket.CaptureInfo {
+	return gopacket.CaptureInfo{
+		Timestamp:      ts,
+		CaptureLength:  len(pkt.data),
+		Length:         pkt.length,
+		InterfaceIndex: interfaces[pkt.action],
+	}
+}
+
+// newPcapWriter creates a pcapWriter with an pcap interface (metadata) per xdp action.
+// snaplen is the interface snap length, 0 meaning no truncation.
+func newPcapWriter(w io.Writer, filterExpr string, actions []xdpAction, snaplen uint32) (*pcapgo.NgWriter, map[xdpAction]int, error) {
 	if len(actions) == 0 {
 		return nil, nil, errors.New("can't create pcap with no actions")
+	}
+
+	if snaplen == 0 {
+		snaplen = math.MaxUint16
 	}
 
 	var interfaces []pcapgo.NgInterface
@@ -214,7 +222,7 @@ func newPcapWriter(w io.Writer, filterExpr string, actions []xdpAction) (*pcapgo
 			Comment:    "XDP action",
 			Filter:     filterExpr,
 			LinkType:   layers.LinkTypeEthernet,
-			SnapLength: uint32(math.MaxUint16),
+			SnapLength: snaplen,
 		})
 		actionIfcs[action] = id
 	}
